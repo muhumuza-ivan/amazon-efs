@@ -201,6 +201,23 @@ Resources:
                   - codeconnections:GetConnection
                 Resource: !Ref ConnectionArn
 
+              # Creating the first repository link in an account makes
+              # CodeConnections provision its service-linked role. Without this
+              # the link fails with "isn't authorized to create a service-linked
+              # role", which reads like a connection problem but is not one. The
+              # AWSServiceName condition means this grants nothing beyond that
+              # one role. Both spellings are listed because the service was
+              # renamed from CodeStar Connections to CodeConnections.
+              - Sid: AllowCodeConnectionsServiceLinkedRole
+                Effect: Allow
+                Action: iam:CreateServiceLinkedRole
+                Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/*"
+                Condition:
+                  StringEquals:
+                    iam:AWSServiceName:
+                      - codeconnections.amazonaws.com
+                      - codestar-connections.amazonaws.com
+
         - PolicyName: verify-deployment
           PolicyDocument:
             Version: "2012-10-17"
