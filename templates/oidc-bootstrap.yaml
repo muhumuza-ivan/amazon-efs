@@ -201,22 +201,23 @@ Resources:
                   - codeconnections:GetConnection
                 Resource: !Ref ConnectionArn
 
-              # Creating the first repository link in an account makes
-              # CodeConnections provision its service-linked role. Without this
-              # the link fails with "isn't authorized to create a service-linked
-              # role", which reads like a connection problem but is not one. The
-              # AWSServiceName condition means this grants nothing beyond that
-              # one role. Both spellings are listed because the service was
-              # renamed from CodeStar Connections to CodeConnections.
-              - Sid: AllowCodeConnectionsServiceLinkedRole
+              # Creating a repository link requires this permission even when
+              # AWSServiceRoleForGitSync already exists - CodeConnections checks
+              # for it up front rather than only on first use. Without it the
+              # link fails with "isn't authorized to create a service-linked
+              # role", which reads like a broken connection but is not one.
+              #
+              # The service principal is repository.sync.codeconnections.amazonaws.com,
+              # not codeconnections.amazonaws.com: the latter is not a valid
+              # service principal at all, and a condition naming it silently
+              # matches nothing, so the grant appears present but never applies.
+              - Sid: AllowGitSyncServiceLinkedRole
                 Effect: Allow
                 Action: iam:CreateServiceLinkedRole
-                Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/*"
+                Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/repository.sync.codeconnections.amazonaws.com/*"
                 Condition:
                   StringEquals:
-                    iam:AWSServiceName:
-                      - codeconnections.amazonaws.com
-                      - codestar-connections.amazonaws.com
+                    iam:AWSServiceName: repository.sync.codeconnections.amazonaws.com
 
         - PolicyName: verify-deployment
           PolicyDocument:
