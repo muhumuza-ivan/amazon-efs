@@ -14,6 +14,10 @@
 
 set -euo pipefail
 
+# Git Bash rewrites arguments that look like Unix paths, which would corrupt the
+# /mnt/efs paths inside the SSM command strings below. Ignored on Linux/macOS.
+export MSYS_NO_PATHCONV=1
+
 PROJECT="${1:-efs-shared}"
 REGION="${2:-${AWS_REGION:-eu-west-1}}"
 ASG="${PROJECT}-asg"
