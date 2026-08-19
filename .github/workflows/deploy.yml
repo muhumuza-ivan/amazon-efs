@@ -61,6 +61,29 @@ jobs:
       - name: Lint
         run: cfn-lint templates/*.yaml --region "$AWS_REGION"
 
+      # Mirrors the equivalent job in lint.yml, so a push to main gets the same
+      # coverage a pull request does.
+      - name: Check deployment files point at real templates
+        run: |
+          python - <<'PY'
+          import pathlib, sys, yaml
+
+          failures = []
+          for path in sorted(pathlib.Path("deployments").glob("*.yaml")):
+              doc = yaml.safe_load(path.read_text())
+              template = doc.get("template-file-path")
+              if not template:
+                  failures.append(f"{path}: missing template-file-path")
+                  continue
+              if not pathlib.Path(template).is_file():
+                  failures.append(f"{path}: template-file-path '{template}' does not exist")
+              print(f"ok  {path} -> {template}")
+
+          if failures:
+              print("\n".join(failures), file=sys.stderr)
+              sys.exit(1)
+          PY
+
   deploy:
     name: Deploy via Git sync
     needs: lint

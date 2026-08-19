@@ -173,6 +173,12 @@ Resources:
                   - iam:PassRole
                 Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${ProjectName}-*"
 
+              # PassRepository is the one that is easy to miss: creating a sync
+              # configuration hands the repository link to the service, and that
+              # is a distinct action from creating or reading the link itself.
+              # Note also that repository-link and sync-configuration ARNs are
+              # still issued under the old codestar-connections namespace even
+              # though the actions are named codeconnections:*.
               - Sid: ManageGitSyncConfiguration
                 Effect: Allow
                 Action:
@@ -181,12 +187,15 @@ Resources:
                   - codeconnections:GetRepositoryLink
                   - codeconnections:UpdateRepositoryLink
                   - codeconnections:ListRepositoryLinks
+                  - codeconnections:PassRepository
+                  - codeconnections:GetRepositorySyncStatus
                   - codeconnections:CreateSyncConfiguration
                   - codeconnections:DeleteSyncConfiguration
                   - codeconnections:GetSyncConfiguration
                   - codeconnections:UpdateSyncConfiguration
                   - codeconnections:ListSyncConfigurations
                   - codeconnections:GetSyncBlockerSummary
+                  - codeconnections:UpdateSyncBlocker
                   - codeconnections:GetResourceSyncStatus
                   - codeconnections:ListTagsForResource
                   - codeconnections:TagResource

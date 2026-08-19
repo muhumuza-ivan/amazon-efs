@@ -34,7 +34,7 @@ CloudFormation Git sync.
 │   ├─ validate.sh         cfn-lint + server-side template validation
 │   └─ verify-efs.sh       end-to-end verification, entirely through Systems Manager
 ├─ diagrams/architecture.drawio
-└─ .github/workflows/lint.yml
+└─ .github/workflows/deploy.yml    lint → staged rollout → end-to-end verification
 ```
 
 ## Architecture

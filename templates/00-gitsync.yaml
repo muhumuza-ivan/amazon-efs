@@ -199,6 +199,15 @@ Resources:
                   - ec2:DeleteVpcEndpoints
                   - ec2:ModifyVpcEndpoint
                   - ec2:DescribeVpcEndpoints
+                  - ec2:DescribeVpcEndpointServices
+                  - ec2:ModifySecurityGroupRules
+                  # Creating an EFS mount target or an interface endpoint makes
+                  # the service create an ENI on your behalf, but the permission
+                  # is checked against the caller, not the service.
+                  - ec2:CreateNetworkInterface
+                  - ec2:DeleteNetworkInterface
+                  - ec2:ModifyNetworkInterfaceAttribute
+                  - ec2:DescribeNetworkInterfaceAttribute
                   - ec2:DescribePrefixLists
                   - ec2:DescribeAvailabilityZones
                   - ec2:DescribeNetworkInterfaces
@@ -283,6 +292,18 @@ Resources:
                 Resource:
                   - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${ProjectName}-*"
                   - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:instance-profile/${ProjectName}-*"
+
+              # Auto Scaling needs AWSServiceRoleForAutoScaling. It already
+              # exists in most accounts, but the permission is checked up front
+              # rather than only when the role is missing - the same trap that
+              # AWSServiceRoleForGitSync sprang on the deploy role.
+              - Sid: AllowAutoScalingServiceLinkedRole
+                Effect: Allow
+                Action: iam:CreateServiceLinkedRole
+                Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/autoscaling.amazonaws.com/*"
+                Condition:
+                  StringEquals:
+                    iam:AWSServiceName: autoscaling.amazonaws.com
 
               - Sid: ResolveAmiParameter
                 Effect: Allow
