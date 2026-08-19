@@ -1,0 +1,19 @@
+# CloudFormation Git sync stack deployment file - stack 2 of 3.
+#
+# Deploy AFTER the network stack. ProjectName must match that stack's value,
+# because it is the prefix used for every cross-stack import.
+
+template-file-path: templates/02-storage.yaml
+
+parameters:
+  ProjectName: efs-shared
+  BackupPolicyStatus: DISABLED
+  SharedDirectoryPath: /shared
+
+tags:
+  Project: efs-shared-storage
+  Component: storage
+  Environment: dev
+  Owner: ivan.muhumuza
+  ManagedBy: cloudformation-gitsync
+  CostCenter: training

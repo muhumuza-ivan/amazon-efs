@@ -1,0 +1,18 @@
+# Assignment brief - kept locally, not part of the deliverable repo.
+# Delete these two lines if you want it published alongside the templates.
+Mount and Share Amazon EFS Across Multiple EC2 Instances.docx
+Mount and share Amazon Efs Across Multiple EC2 instances.md
+
+# Local AWS config
+.aws/
+*.pem
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Scratch output
+*.log
+/tmp/

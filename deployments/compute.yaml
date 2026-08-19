@@ -1,0 +1,23 @@
+# CloudFormation Git sync stack deployment file - stack 3 of 3.
+#
+# Deploy LAST. Imports subnets and the instance security group from the network
+# stack, and the file system and access point from the storage stack.
+
+template-file-path: templates/03-compute.yaml
+
+parameters:
+  ProjectName: efs-shared
+  InstanceType: t3.micro
+  RootVolumeSizeGiB: 8
+  MountPoint: /mnt/efs
+  MinSize: 1
+  DesiredCapacity: 2
+  MaxSize: 4
+
+tags:
+  Project: efs-shared-storage
+  Component: compute
+  Environment: dev
+  Owner: ivan.muhumuza
+  ManagedBy: cloudformation-gitsync
+  CostCenter: training

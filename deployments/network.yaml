@@ -1,0 +1,20 @@
+# CloudFormation Git sync stack deployment file - stack 1 of 3.
+#
+# Deploy this stack FIRST. The storage and compute stacks import its exports.
+# Every key under `tags` is applied to all taggable resources in the stack.
+
+template-file-path: templates/01-network.yaml
+
+parameters:
+  ProjectName: efs-shared
+  VpcCidr: 10.0.0.0/16
+  PrivateSubnet1Cidr: 10.0.1.0/24
+  PrivateSubnet2Cidr: 10.0.2.0/24
+
+tags:
+  Project: efs-shared-storage
+  Component: network
+  Environment: dev
+  Owner: ivan.muhumuza
+  ManagedBy: cloudformation-gitsync
+  CostCenter: training

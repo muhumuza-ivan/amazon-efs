@@ -1,0 +1,178 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >-
+  Stack 2/3 - Shared storage. Creates one encrypted Amazon EFS file system with
+  a mount target in every private subnet (one per Availability Zone), an access
+  point that enforces a fixed POSIX identity for all clients, and a file system
+  policy that refuses any connection not encrypted in transit.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Project identity
+        Parameters:
+          - ProjectName
+      - Label:
+          default: File system options
+        Parameters:
+          - BackupPolicyStatus
+          - SharedDirectoryPath
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: efs-shared
+    AllowedPattern: "^[a-z][a-z0-9-]{2,30}$"
+    Description: >-
+      Must match the value used for the network stack - it is the prefix for
+      every cross-stack import and export.
+
+  BackupPolicyStatus:
+    Type: String
+    Default: DISABLED
+    AllowedValues:
+      - ENABLED
+      - DISABLED
+    Description: >-
+      AWS Backup automatic backups. DISABLED by default to keep the
+      demonstration environment cheap; set to ENABLED for anything real.
+
+  SharedDirectoryPath:
+    Type: String
+    Default: /shared
+    AllowedPattern: "^/[a-zA-Z0-9._-]+$"
+    Description: >-
+      Directory inside the file system that the access point exposes as its
+      root. Created automatically on first use.
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # File system.
+  #
+  # Bursting throughput is chosen over Elastic on purpose: Elastic bills per
+  # request, which for a mostly-idle shared volume costs more than the burst
+  # credits this workload will ever exhaust.
+  #
+  # The file system policy replaces EFS's permissive default. The explicit Deny
+  # makes encryption in transit non-optional - a client that omits the `tls`
+  # mount option is refused rather than silently downgraded. Note that
+  # ClientRootAccess is deliberately not granted: the access point below pins
+  # every client to a non-root POSIX identity, so root access is unnecessary.
+  # ---------------------------------------------------------------------------
+  EfsFileSystem:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      Encrypted: true
+      PerformanceMode: generalPurpose
+      ThroughputMode: bursting
+      BackupPolicy:
+        Status: !Ref BackupPolicyStatus
+      LifecyclePolicies:
+        - TransitionToIA: AFTER_30_DAYS
+        - TransitionToPrimaryStorageClass: AFTER_1_ACCESS
+      FileSystemPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyAccessWithoutTlsInTransit
+            Effect: Deny
+            Principal:
+              AWS: "*"
+            Action: "*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+          - Sid: AllowMountAndWriteThroughMountTargets
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+            Action:
+              - elasticfilesystem:ClientMount
+              - elasticfilesystem:ClientWrite
+            Condition:
+              Bool:
+                elasticfilesystem:AccessedViaMountTarget: "true"
+      FileSystemTags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-efs"
+
+  # ---------------------------------------------------------------------------
+  # Mount targets - one per subnet, which is one per Availability Zone.
+  # EFS allows no more than one mount target per AZ per file system.
+  # ---------------------------------------------------------------------------
+  MountTargetAz1:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EfsFileSystem
+      SubnetId:
+        Fn::ImportValue: !Sub "${ProjectName}-PrivateSubnet1Id"
+      SecurityGroups:
+        - Fn::ImportValue: !Sub "${ProjectName}-EfsSecurityGroupId"
+
+  MountTargetAz2:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EfsFileSystem
+      SubnetId:
+        Fn::ImportValue: !Sub "${ProjectName}-PrivateSubnet2Id"
+      SecurityGroups:
+        - Fn::ImportValue: !Sub "${ProjectName}-EfsSecurityGroupId"
+
+  # ---------------------------------------------------------------------------
+  # Access point.
+  #
+  # PosixUser forces every operation through this access point to run as uid/gid
+  # 1000, whatever the calling OS user is. That matters because Session Manager
+  # drops you in as `ssm-user` (uid 1001), not `ec2-user` - without the access
+  # point, a shell opened through Session Manager could not write to the share
+  # unless the root directory were made world-writable.
+  # ---------------------------------------------------------------------------
+  EfsAccessPoint:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref EfsFileSystem
+      PosixUser:
+        Uid: "1000"
+        Gid: "1000"
+      RootDirectory:
+        Path: !Ref SharedDirectoryPath
+        CreationInfo:
+          OwnerUid: "1000"
+          OwnerGid: "1000"
+          Permissions: "0755"
+      AccessPointTags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-ap"
+
+Outputs:
+  FileSystemId:
+    Description: EFS file system id, used as the mount source
+    Value: !Ref EfsFileSystem
+    Export:
+      Name: !Sub "${ProjectName}-FileSystemId"
+
+  FileSystemArn:
+    Description: EFS file system ARN
+    Value: !GetAtt EfsFileSystem.Arn
+    Export:
+      Name: !Sub "${ProjectName}-FileSystemArn"
+
+  AccessPointId:
+    Description: EFS access point id
+    Value: !Ref EfsAccessPoint
+    Export:
+      Name: !Sub "${ProjectName}-AccessPointId"
+
+  AccessPointArn:
+    Description: EFS access point ARN
+    Value: !GetAtt EfsAccessPoint.Arn
+    Export:
+      Name: !Sub "${ProjectName}-AccessPointArn"
+
+  MountTargetAz1Id:
+    Description: Mount target in the first Availability Zone
+    Value: !Ref MountTargetAz1
+
+  MountTargetAz2Id:
+    Description: Mount target in the second Availability Zone
+    Value: !Ref MountTargetAz2

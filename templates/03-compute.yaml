@@ -1,0 +1,306 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >-
+  Stack 3/3 - Compute. Creates the SSM-enabled instance profile, a launch
+  template whose user data mounts the shared EFS file system over TLS with IAM
+  authorization, and an Auto Scaling group spread across both private subnets.
+  Instances receive no public IP address and expose no inbound ports; the only
+  way in is AWS Systems Manager Session Manager.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Project identity
+        Parameters:
+          - ProjectName
+      - Label:
+          default: Instances
+        Parameters:
+          - InstanceType
+          - LatestAmiId
+          - RootVolumeSizeGiB
+          - MountPoint
+      - Label:
+          default: Auto Scaling capacity
+        Parameters:
+          - MinSize
+          - DesiredCapacity
+          - MaxSize
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: efs-shared
+    AllowedPattern: "^[a-z][a-z0-9-]{2,30}$"
+    Description: >-
+      Must match the value used for the network and storage stacks - it is the
+      prefix for every cross-stack import.
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+    Description: >-
+      Burstable instance type. Kept to the t3 family because the launch template
+      pins CPU credits to standard; switching to Graviton (t4g) also requires
+      changing LatestAmiId to the arm64 AMI parameter.
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: >-
+      Public SSM parameter resolving to the current Amazon Linux 2023 AMI. Using
+      the parameter rather than a hardcoded AMI id means every launch picks up
+      the latest patched image, and keeps the template region-portable.
+
+  RootVolumeSizeGiB:
+    Type: Number
+    Default: 8
+    MinValue: 8
+    MaxValue: 100
+    Description: Size of the encrypted gp3 root volume.
+
+  MountPoint:
+    Type: String
+    Default: /mnt/efs
+    AllowedPattern: "^/[a-zA-Z0-9._/-]+$"
+    Description: Local directory where the shared file system is mounted.
+
+  MinSize:
+    Type: Number
+    Default: 1
+    MinValue: 0
+    Description: Minimum number of instances.
+
+  DesiredCapacity:
+    Type: Number
+    Default: 2
+    MinValue: 0
+    Description: Desired number of instances.
+
+  MaxSize:
+    Type: Number
+    Default: 4
+    MinValue: 1
+    Description: Maximum number of instances.
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # Instance role.
+  #
+  # AmazonSSMManagedInstanceCore is the entire permission set Session Manager
+  # needs. The inline EFS policy is scoped to one file system and further
+  # conditioned on one access point, so the role cannot mount anything else and
+  # cannot bypass the access point's POSIX identity enforcement.
+  # ---------------------------------------------------------------------------
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-instance-role"
+      Description: Session Manager access plus scoped EFS client permissions
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
+      Policies:
+        - PolicyName: efs-client-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: MountAndWriteSharedFileSystemViaAccessPoint
+                Effect: Allow
+                Action:
+                  - elasticfilesystem:ClientMount
+                  - elasticfilesystem:ClientWrite
+                Resource:
+                  Fn::ImportValue: !Sub "${ProjectName}-FileSystemArn"
+                Condition:
+                  StringEquals:
+                    elasticfilesystem:AccessPointArn:
+                      Fn::ImportValue: !Sub "${ProjectName}-AccessPointArn"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-instance-role"
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub "${ProjectName}-instance-profile"
+      Roles:
+        - !Ref InstanceRole
+
+  # ---------------------------------------------------------------------------
+  # Launch template.
+  #
+  # Because NetworkInterfaces is specified, the security group must be declared
+  # inside it as `Groups` - a top-level SecurityGroupIds alongside it is
+  # rejected by EC2.
+  # ---------------------------------------------------------------------------
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${ProjectName}-lt"
+      VersionDescription: Mounts the shared EFS file system at boot
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt InstanceProfile.Arn
+        CreditSpecification:
+          CpuCredits: standard
+        Monitoring:
+          Enabled: false
+        MetadataOptions:
+          HttpTokens: required
+          HttpPutResponseHopLimit: 1
+          HttpEndpoint: enabled
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            AssociatePublicIpAddress: false
+            DeleteOnTermination: true
+            Groups:
+              - Fn::ImportValue: !Sub "${ProjectName}-InstanceSecurityGroupId"
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeType: gp3
+              VolumeSize: !Ref RootVolumeSizeGiB
+              Encrypted: true
+              DeleteOnTermination: true
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub "${ProjectName}-node"
+          - ResourceType: volume
+            Tags:
+              - Key: Name
+                Value: !Sub "${ProjectName}-node-root"
+        UserData:
+          Fn::Base64:
+            Fn::Sub:
+              - |
+                #!/bin/bash
+                set -euxo pipefail
+                exec > >(tee -a /var/log/efs-bootstrap.log) 2>&1
+
+                MP="${MountPointValue}"
+                FS="${FileSystemIdValue}"
+                AP="${AccessPointIdValue}"
+
+                # Nothing is installed here, on purpose. amazon-efs-utils ships
+                # with the Amazon Linux 2023 AMI, and the mount helper resolves a
+                # file system id straight to the mount target's ENI address
+                # without calling any AWS API. That is what lets this instance
+                # mount the share with no NAT gateway and no internet gateway.
+                mkdir -p "$MP"
+
+                if ! grep -q " $MP " /etc/fstab; then
+                  echo "$FS $MP efs _netdev,tls,iam,accesspoint=$AP 0 0" >> /etc/fstab
+                fi
+
+                # A mount target can still be transitioning to `available` when a
+                # scaled-out instance boots, so retry rather than fail the launch.
+                for attempt in $(seq 1 12); do
+                  if mount -a -t efs; then
+                    break
+                  fi
+                  echo "mount attempt $attempt failed, retrying"
+                  sleep 15
+                done
+
+                if ! mountpoint -q "$MP"; then
+                  echo "FATAL: $MP did not mount" >&2
+                  exit 1
+                fi
+
+                # Drop a marker file so cross-instance visibility can be observed
+                # the moment a second instance finishes booting.
+                TOKEN=$(curl -sX PUT http://169.254.169.254/latest/api/token \
+                  -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+                IID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+                  http://169.254.169.254/latest/meta-data/instance-id)
+                AZ=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+                  http://169.254.169.254/latest/meta-data/placement/availability-zone)
+
+                mkdir -p "$MP/hosts"
+                echo "$IID booted in $AZ at $(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$MP/hosts/$IID.txt"
+                echo "EFS bootstrap complete on $IID"
+              - MountPointValue: !Ref MountPoint
+                FileSystemIdValue:
+                  Fn::ImportValue: !Sub "${ProjectName}-FileSystemId"
+                AccessPointIdValue:
+                  Fn::ImportValue: !Sub "${ProjectName}-AccessPointId"
+
+  # ---------------------------------------------------------------------------
+  # Auto Scaling group.
+  #
+  # No CreationPolicy / cfn-signal here: aws-cfn-bootstrap is not present on the
+  # Amazon Linux 2023 AMI and could not be installed without internet access, so
+  # a signal-based CreationPolicy would simply stall until timeout. Bootstrap
+  # success is verified through Session Manager instead - see scripts/verify-efs.sh.
+  # ---------------------------------------------------------------------------
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub "${ProjectName}-asg"
+      MinSize: !Ref MinSize
+      MaxSize: !Ref MaxSize
+      DesiredCapacity: !Ref DesiredCapacity
+      VPCZoneIdentifier:
+        - Fn::ImportValue: !Sub "${ProjectName}-PrivateSubnet1Id"
+        - Fn::ImportValue: !Sub "${ProjectName}-PrivateSubnet2Id"
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      HealthCheckType: EC2
+      HealthCheckGracePeriod: 300
+      MetricsCollection:
+        - Granularity: 1Minute
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-node"
+          PropagateAtLaunch: true
+        - Key: Role
+          Value: efs-client
+          PropagateAtLaunch: true
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        MaxBatchSize: 1
+        PauseTime: PT5M
+        WaitOnResourceSignals: false
+
+Outputs:
+  AutoScalingGroupName:
+    Description: Auto Scaling group name
+    Value: !Ref AutoScalingGroup
+    Export:
+      Name: !Sub "${ProjectName}-AutoScalingGroupName"
+
+  LaunchTemplateId:
+    Description: Launch template id
+    Value: !Ref LaunchTemplate
+
+  InstanceRoleArn:
+    Description: ARN of the EC2 instance role
+    Value: !GetAtt InstanceRole.Arn
+
+  MountPoint:
+    Description: Local path where the shared file system is mounted
+    Value: !Ref MountPoint
+    Export:
+      Name: !Sub "${ProjectName}-MountPoint"
+
+  SessionManagerHint:
+    Description: How to connect to an instance
+    Value: !Sub "aws ssm start-session --target <instance-id> --region ${AWS::Region}"

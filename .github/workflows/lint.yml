@@ -1,0 +1,59 @@
+name: Validate templates
+
+# Templates are deployed straight from this branch by CloudFormation Git sync,
+# so a broken template on main becomes a failed stack update. Lint every change
+# before it merges.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  cfn-lint:
+    name: cfn-lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install cfn-lint
+        run: pip install --disable-pip-version-check cfn-lint
+
+      - name: Lint CloudFormation templates
+        run: cfn-lint templates/*.yaml --region eu-west-1
+
+  deployment-files:
+    name: Deployment files
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check every deployment file parses and points at a real template
+        run: |
+          python - <<'PY'
+          import pathlib, sys, yaml
+
+          failures = []
+          for path in sorted(pathlib.Path("deployments").glob("*.yaml")):
+              doc = yaml.safe_load(path.read_text())
+              template = doc.get("template-file-path")
+              if not template:
+                  failures.append(f"{path}: missing template-file-path")
+                  continue
+              if not pathlib.Path(template).is_file():
+                  failures.append(f"{path}: template-file-path '{template}' does not exist")
+              if len(doc.get("parameters", {})) > 50:
+                  failures.append(f"{path}: more than 50 parameters")
+              if len(doc.get("tags", {})) > 50:
+                  failures.append(f"{path}: more than 50 tags")
+              print(f"ok  {path} -> {template}")
+
+          if failures:
+              print("\n".join(failures), file=sys.stderr)
+              sys.exit(1)
+          PY
