@@ -14,8 +14,7 @@ Metadata:
       - Label:
           default: Repository that is allowed to assume the role
         Parameters:
-          - GitHubOwner
-          - RepositoryName
+          - SubjectClaimPrefix
           - BranchName
       - Label:
           default: AWS side
@@ -25,17 +24,20 @@ Metadata:
           - CreateOidcProvider
 
 Parameters:
-  GitHubOwner:
+  SubjectClaimPrefix:
     Type: String
-    Default: muhumuza-ivan
+    Default: repo:muhumuza-ivan@211486075/amazon-efs@1339316430
     MinLength: 1
-    Description: GitHub user or organization that owns the repository.
-
-  RepositoryName:
-    Type: String
-    Default: amazon-efs
-    MinLength: 1
-    Description: Repository name, without the owner prefix.
+    AllowedPattern: "^repo:[^:]+$"
+    Description: >-
+      The repository portion of the OIDC sub claim, without the trailing
+      ":ref:refs/heads/<branch>". GitHub uses one of two forms. Repositories
+      created before 15 July 2026 use the classic form, repo:OWNER/REPO.
+      Newer repositories use immutable identifiers,
+      repo:OWNER@OWNER-ID/REPO@REPO-ID, so that a rename or transfer cannot
+      silently redirect the trust. Copy the exact value from the repository's
+      Settings > Actions > OpenID Connect page - guessing it means the role
+      simply never becomes assumable.
 
   BranchName:
     Type: String
@@ -116,7 +118,7 @@ Resources:
             Condition:
               StringEquals:
                 token.actions.githubusercontent.com:aud: sts.amazonaws.com
-                token.actions.githubusercontent.com:sub: !Sub "repo:${GitHubOwner}/${RepositoryName}:ref:refs/heads/${BranchName}"
+                token.actions.githubusercontent.com:sub: !Sub "${SubjectClaimPrefix}:ref:refs/heads/${BranchName}"
       Policies:
         - PolicyName: deploy-gitsync-bootstrap
           PolicyDocument:
@@ -245,5 +247,8 @@ Outputs:
     Value: !Ref ConnectionArn
 
   TrustedSubject:
-    Description: The only OIDC subject claim permitted to assume the role
-    Value: !Sub "repo:${GitHubOwner}/${RepositoryName}:ref:refs/heads/${BranchName}"
+    Description: >-
+      The only OIDC subject claim permitted to assume the role. If a workflow run
+      fails with "Not authorized to perform sts:AssumeRoleWithWebIdentity",
+      compare this against the sub claim in that run's token.
+    Value: !Sub "${SubjectClaimPrefix}:ref:refs/heads/${BranchName}"
