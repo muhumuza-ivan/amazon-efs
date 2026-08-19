@@ -25,6 +25,7 @@ CloudFormation Git sync.
 │   ├─ storage.yaml
 │   └─ compute.yaml
 ├─ templates/
+│   ├─ 00-gitsync.yaml     Repository link, Git sync service role, sync configurations
 │   ├─ 01-network.yaml     VPC, private subnets, route tables, VPC endpoints, security groups
 │   ├─ 02-storage.yaml     EFS file system, mount targets, access point, file system policy
 │   └─ 03-compute.yaml     IAM instance profile, launch template, Auto Scaling group
@@ -97,26 +98,71 @@ cross-stack export.
 
 ### Option A — CloudFormation Git sync (the intended path)
 
-Push this repository to GitHub, then create **three** sync configurations, one per stack.
-For each, in the CloudFormation console choose **Create stack → With new resources → Sync
-from Git**, and:
+Git sync is itself provisioned as code. [templates/00-gitsync.yaml](templates/00-gitsync.yaml)
+creates the repository link, the Git sync service role, and one sync configuration per
+stack — so the network, storage and compute stacks are created and updated by Git sync
+rather than by hand. That bootstrap stack is the only one deployed manually; it is the
+seed that makes everything else Git-managed.
 
-1. Name the stack, e.g. `efs-shared-network`.
-2. Pick your CodeConnections connection, this repository, and the `main` branch.
-3. Choose **Use existing deployment file** and give the path from the table below.
-4. Let CloudFormation create the Git sync service role if you do not already have one.
-5. Merge the pull request CloudFormation opens. It then provisions the stack and watches
-   the branch for further commits.
+**Step 1 — connect GitHub to AWS.** This is the one step that cannot be automated: the
+AWS CLI can create a connection, but it starts in `PENDING` and the OAuth handshake that
+moves it to `AVAILABLE` only exists in the browser.
 
-| Order | Stack name | Deployment file |
+```bash
+aws codeconnections create-connection --region eu-west-1 \
+  --provider-type GitHub --connection-name github-efs-shared
+```
+
+Then open the [Connections console](https://console.aws.amazon.com/codesuite/settings/connections),
+select the pending connection, choose **Update pending connection**, authorize the AWS
+Connector for GitHub, and confirm the status reads `AVAILABLE`. Note the connection ARN.
+
+**Step 2 — bootstrap Git sync, one stack at a time.** Creating a sync configuration for a
+stack that does not exist causes CloudFormation to create that stack immediately. All
+three at once would race: storage and compute would fail on exports the network stack has
+not published yet. So deploy the bootstrap stack three times, widening `SyncScope` each
+time and waiting for the synced stack to finish in between:
+
+```bash
+REGION=eu-west-1
+CONN_ARN=arn:aws:codeconnections:eu-west-1:<account>:connection/<uuid>
+OWNER=<your-github-username>
+
+deploy_gitsync () {
+  aws cloudformation deploy --region $REGION \
+    --stack-name efs-shared-gitsync \
+    --template-file templates/00-gitsync.yaml \
+    --capabilities CAPABILITY_NAMED_IAM \
+    --parameter-overrides ConnectionArn=$CONN_ARN GitHubOwner=$OWNER \
+                          RepositoryName=amazon-efs BranchName=main \
+                          SyncScope="$1"
+}
+
+deploy_gitsync network
+aws cloudformation wait stack-create-complete --region $REGION --stack-name efs-shared-network
+
+deploy_gitsync network-and-storage
+aws cloudformation wait stack-create-complete --region $REGION --stack-name efs-shared-storage
+
+deploy_gitsync all
+aws cloudformation wait stack-create-complete --region $REGION --stack-name efs-shared-compute
+```
+
+| Sync configuration | Deployment file | Stack it manages |
 |---|---|---|
-| 1 | `efs-shared-network` | `deployments/network.yaml` |
-| 2 | `efs-shared-storage` | `deployments/storage.yaml` |
-| 3 | `efs-shared-compute` | `deployments/compute.yaml` |
+| `NetworkSync` | `deployments/network.yaml` | `efs-shared-network` |
+| `StorageSync` | `deployments/storage.yaml` | `efs-shared-storage` |
+| `ComputeSync` | `deployments/compute.yaml` | `efs-shared-compute` |
 
-Wait for each stack to reach `CREATE_COMPLETE` before creating the next sync
-configuration. From then on, editing a template or a deployment file and committing to
-`main` updates the corresponding stack automatically.
+From then on, editing a template or a deployment file and committing to `main` updates the
+corresponding stack automatically. `TriggerResourceUpdateOn: FILE_CHANGE` means only the
+stack whose files changed is updated, so a compute change does not churn the network
+stack.
+
+The sync role is scoped rather than administrative: it can act on CloudFormation, and on
+exactly the EC2/EFS/Auto Scaling actions these templates need, with IAM access restricted
+to `efs-shared-*` roles and instance profiles. Its trust policy carries `aws:SourceAccount`
+and `aws:SourceArn` conditions so no other account's connection can assume it.
 
 ### Option B — direct deploy (useful as a first smoke test)
 

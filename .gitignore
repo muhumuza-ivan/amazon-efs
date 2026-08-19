@@ -1,7 +1,7 @@
 # Assignment brief - kept locally, not part of the deliverable repo.
-# Delete these two lines if you want it published alongside the templates.
+# Delete these lines if you want it published alongside the templates.
 Mount and Share Amazon EFS Across Multiple EC2 Instances.docx
-Mount and share Amazon Efs Across Multiple EC2 instances.md
+lab-instructions.md
 
 # Local AWS config
 .aws/

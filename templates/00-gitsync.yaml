@@ -1,0 +1,363 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >-
+  Stack 0/3 - GitSync bootstrap. Links this GitHub repository to CloudFormation
+  and creates one sync configuration per stack, so that the network, storage and
+  compute stacks are themselves created and updated by CloudFormation Git sync
+  rather than by hand.
+
+  This is the one stack that must be deployed manually - it is the seed that
+  makes every other stack Git-managed.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Repository
+        Parameters:
+          - ConnectionArn
+          - GitHubOwner
+          - RepositoryName
+          - BranchName
+      - Label:
+          default: Rollout
+        Parameters:
+          - ProjectName
+          - SyncScope
+    ParameterLabels:
+      ConnectionArn:
+        default: CodeConnections connection ARN (must be AVAILABLE)
+      SyncScope:
+        default: Which stacks to bring under Git sync
+
+Parameters:
+  ConnectionArn:
+    Type: String
+    AllowedPattern: "^arn:aws[a-zA-Z-]*:codeconnections:[a-z0-9-]+:\\d{12}:connection/[0-9a-fA-F-]+$"
+    Description: >-
+      ARN of the AWS CodeConnections connection to GitHub. The connection must
+      already be in AVAILABLE status - a connection created by the CLI starts as
+      PENDING and can only be completed through the console.
+
+  GitHubOwner:
+    Type: String
+    MinLength: 1
+    Description: GitHub user or organization that owns the repository.
+
+  RepositoryName:
+    Type: String
+    Default: amazon-efs
+    MinLength: 1
+    Description: Repository name, without the owner prefix.
+
+  BranchName:
+    Type: String
+    Default: main
+    MinLength: 1
+    Description: Branch that CloudFormation watches for changes.
+
+  ProjectName:
+    Type: String
+    Default: efs-shared
+    AllowedPattern: "^[a-z][a-z0-9-]{2,30}$"
+    Description: >-
+      Prefix for the synced stack names. Must match the ProjectName used in the
+      deployment files, since it also prefixes every cross-stack export.
+
+  SyncScope:
+    Type: String
+    Default: network
+    AllowedValues:
+      - network
+      - network-and-storage
+      - all
+    Description: >-
+      Which sync configurations to create. Creating a sync configuration for a
+      stack that does not exist yet causes CloudFormation to create that stack
+      immediately, so all three at once would race: storage and compute would
+      fail on exports the network stack has not published yet. Deploy this stack
+      three times - network, then network-and-storage, then all - waiting for
+      each synced stack to reach CREATE_COMPLETE in between.
+
+Conditions:
+  SyncStorage: !Not [!Equals [!Ref SyncScope, network]]
+  SyncCompute: !Equals [!Ref SyncScope, all]
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # Repository link - the association between the CodeConnections connection and
+  # one specific repository.
+  # ---------------------------------------------------------------------------
+  RepositoryLink:
+    Type: AWS::CodeStarConnections::RepositoryLink
+    Properties:
+      ConnectionArn: !Ref ConnectionArn
+      OwnerId: !Ref GitHubOwner
+      RepositoryName: !Ref RepositoryName
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-repo-link"
+
+  # ---------------------------------------------------------------------------
+  # Git sync service role.
+  #
+  # Git sync assumes this role to create and execute change sets. Because
+  # CloudFormation acts with the caller's permissions when no stack role is set,
+  # this role also needs to create everything the three templates declare - so
+  # the actions below are enumerated rather than granted as service wildcards.
+  #
+  # The trust policy carries aws:SourceAccount and aws:SourceArn conditions,
+  # which stop any other account's connection from assuming this role
+  # (the confused deputy problem).
+  # ---------------------------------------------------------------------------
+  GitSyncRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-gitsync-role"
+      Description: Assumed by CloudFormation Git sync to deploy the stacks in this repository
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: CfnGitSyncTrustPolicy
+            Effect: Allow
+            Principal:
+              Service: cloudformation.sync.codeconnections.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Ref ConnectionArn
+      Policies:
+        - PolicyName: gitsync-cloudformation
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: SyncToCloudFormation
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStackResource
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:DescribeStacks
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:GetTemplate
+                  - cloudformation:GetTemplateSummary
+                  - cloudformation:ListChangeSets
+                  - cloudformation:ListStacks
+                  - cloudformation:ValidateTemplate
+                Resource: "*"
+
+              - Sid: PolicyForManagedRules
+                Effect: Allow
+                Action:
+                  - events:PutRule
+                  - events:PutTargets
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    events:ManagedBy: cloudformation.sync.codeconnections.amazonaws.com
+
+              - Sid: PolicyForDescribingRule
+                Effect: Allow
+                Action: events:DescribeRule
+                Resource: "*"
+
+        - PolicyName: gitsync-provision-resources
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: NetworkResources
+                Effect: Allow
+                Action:
+                  - ec2:CreateVpc
+                  - ec2:DeleteVpc
+                  - ec2:ModifyVpcAttribute
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeVpcAttribute
+                  - ec2:CreateSubnet
+                  - ec2:DeleteSubnet
+                  - ec2:ModifySubnetAttribute
+                  - ec2:DescribeSubnets
+                  - ec2:CreateRouteTable
+                  - ec2:DeleteRouteTable
+                  - ec2:AssociateRouteTable
+                  - ec2:DisassociateRouteTable
+                  - ec2:DescribeRouteTables
+                  - ec2:CreateSecurityGroup
+                  - ec2:DeleteSecurityGroup
+                  - ec2:AuthorizeSecurityGroupIngress
+                  - ec2:AuthorizeSecurityGroupEgress
+                  - ec2:RevokeSecurityGroupIngress
+                  - ec2:RevokeSecurityGroupEgress
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeSecurityGroupRules
+                  - ec2:CreateVpcEndpoint
+                  - ec2:DeleteVpcEndpoints
+                  - ec2:ModifyVpcEndpoint
+                  - ec2:DescribeVpcEndpoints
+                  - ec2:DescribePrefixLists
+                  - ec2:DescribeAvailabilityZones
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DescribeInternetGateways
+                  - ec2:DescribeNatGateways
+                  - ec2:DescribeAccountAttributes
+                  - ec2:CreateTags
+                  - ec2:DeleteTags
+                  - ec2:DescribeTags
+                Resource: "*"
+
+              - Sid: StorageResources
+                Effect: Allow
+                Action:
+                  - elasticfilesystem:CreateFileSystem
+                  - elasticfilesystem:DeleteFileSystem
+                  - elasticfilesystem:DescribeFileSystems
+                  - elasticfilesystem:CreateMountTarget
+                  - elasticfilesystem:DeleteMountTarget
+                  - elasticfilesystem:DescribeMountTargets
+                  - elasticfilesystem:CreateAccessPoint
+                  - elasticfilesystem:DeleteAccessPoint
+                  - elasticfilesystem:DescribeAccessPoints
+                  - elasticfilesystem:PutFileSystemPolicy
+                  - elasticfilesystem:DeleteFileSystemPolicy
+                  - elasticfilesystem:DescribeFileSystemPolicy
+                  - elasticfilesystem:PutLifecycleConfiguration
+                  - elasticfilesystem:DescribeLifecycleConfiguration
+                  - elasticfilesystem:PutBackupPolicy
+                  - elasticfilesystem:DescribeBackupPolicy
+                  - elasticfilesystem:TagResource
+                  - elasticfilesystem:UntagResource
+                  - elasticfilesystem:ListTagsForResource
+                Resource: "*"
+
+              - Sid: ComputeResources
+                Effect: Allow
+                Action:
+                  - ec2:CreateLaunchTemplate
+                  - ec2:DeleteLaunchTemplate
+                  - ec2:CreateLaunchTemplateVersion
+                  - ec2:ModifyLaunchTemplate
+                  - ec2:DescribeLaunchTemplates
+                  - ec2:DescribeLaunchTemplateVersions
+                  - ec2:DescribeImages
+                  - ec2:DescribeInstances
+                  - ec2:RunInstances
+                  - autoscaling:CreateAutoScalingGroup
+                  - autoscaling:DeleteAutoScalingGroup
+                  - autoscaling:UpdateAutoScalingGroup
+                  - autoscaling:DescribeAutoScalingGroups
+                  - autoscaling:DescribeScalingActivities
+                  - autoscaling:CreateOrUpdateTags
+                  - autoscaling:DeleteTags
+                  - autoscaling:EnableMetricsCollection
+                  - autoscaling:DisableMetricsCollection
+                Resource: "*"
+
+              - Sid: InstanceRoleManagement
+                Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:GetRole
+                  - iam:PassRole
+                  - iam:TagRole
+                  - iam:UntagRole
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:GetRolePolicy
+                  - iam:ListRolePolicies
+                  - iam:ListAttachedRolePolicies
+                  - iam:CreateInstanceProfile
+                  - iam:DeleteInstanceProfile
+                  - iam:GetInstanceProfile
+                  - iam:TagInstanceProfile
+                  - iam:AddRoleToInstanceProfile
+                  - iam:RemoveRoleFromInstanceProfile
+                  - iam:ListInstanceProfilesForRole
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${ProjectName}-*"
+                  - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:instance-profile/${ProjectName}-*"
+
+              - Sid: ResolveAmiParameter
+                Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}::parameter/aws/service/ami-amazon-linux-latest/*"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-gitsync-role"
+
+  # ---------------------------------------------------------------------------
+  # Sync configurations - one per stack.
+  #
+  # ResourceName is the name of the stack this configuration manages. If that
+  # stack does not exist, CloudFormation creates it; if it does, Git sync adopts
+  # it. TriggerResourceUpdateOn: FILE_CHANGE limits updates to commits that
+  # actually touch this stack's deployment file or template, so a change to the
+  # compute stack does not churn the network stack.
+  # ---------------------------------------------------------------------------
+  NetworkSync:
+    Type: AWS::CodeStarConnections::SyncConfiguration
+    Properties:
+      Branch: !Ref BranchName
+      ConfigFile: deployments/network.yaml
+      RepositoryLinkId: !GetAtt RepositoryLink.RepositoryLinkId
+      ResourceName: !Sub "${ProjectName}-network"
+      RoleArn: !GetAtt GitSyncRole.Arn
+      SyncType: CFN_STACK_SYNC
+      PublishDeploymentStatus: ENABLED
+      TriggerResourceUpdateOn: FILE_CHANGE
+
+  StorageSync:
+    Type: AWS::CodeStarConnections::SyncConfiguration
+    Condition: SyncStorage
+    DependsOn: NetworkSync
+    Properties:
+      Branch: !Ref BranchName
+      ConfigFile: deployments/storage.yaml
+      RepositoryLinkId: !GetAtt RepositoryLink.RepositoryLinkId
+      ResourceName: !Sub "${ProjectName}-storage"
+      RoleArn: !GetAtt GitSyncRole.Arn
+      SyncType: CFN_STACK_SYNC
+      PublishDeploymentStatus: ENABLED
+      TriggerResourceUpdateOn: FILE_CHANGE
+
+  ComputeSync:
+    Type: AWS::CodeStarConnections::SyncConfiguration
+    Condition: SyncCompute
+    DependsOn: StorageSync
+    Properties:
+      Branch: !Ref BranchName
+      ConfigFile: deployments/compute.yaml
+      RepositoryLinkId: !GetAtt RepositoryLink.RepositoryLinkId
+      ResourceName: !Sub "${ProjectName}-compute"
+      RoleArn: !GetAtt GitSyncRole.Arn
+      SyncType: CFN_STACK_SYNC
+      PublishDeploymentStatus: ENABLED
+      TriggerResourceUpdateOn: FILE_CHANGE
+
+Outputs:
+  RepositoryLinkId:
+    Description: Repository link joining the connection to this repository
+    Value: !GetAtt RepositoryLink.RepositoryLinkId
+
+  GitSyncRoleArn:
+    Description: Role assumed by Git sync to deploy the stacks
+    Value: !GetAtt GitSyncRole.Arn
+
+  SyncedStacks:
+    Description: Stacks currently under Git sync management
+    Value: !If
+      - SyncCompute
+      - !Sub "${ProjectName}-network, ${ProjectName}-storage, ${ProjectName}-compute"
+      - !If
+        - SyncStorage
+        - !Sub "${ProjectName}-network, ${ProjectName}-storage"
+        - !Sub "${ProjectName}-network"
