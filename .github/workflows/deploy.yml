@@ -1,0 +1,213 @@
+name: Deploy
+
+# The whole rollout, automated. A push to main lints the templates, deploys the
+# Git sync bootstrap stack in stages, and then proves the result works by
+# driving the running instances through Systems Manager.
+#
+# Nothing here holds AWS credentials: the runner federates into
+# efs-shared-github-actions-role via OIDC, and that role is only assumable from
+# this repository's main branch.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "templates/**"
+      - "deployments/**"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch:
+    inputs:
+      sync_scope:
+        description: How far to roll out
+        default: all
+        type: choice
+        options:
+          - network
+          - network-and-storage
+          - all
+      run_verification:
+        description: Run the end-to-end EFS verification afterwards
+        default: true
+        type: boolean
+
+permissions:
+  id-token: write # required to request the OIDC token
+  contents: read
+
+# Two overlapping rollouts would fight over the same stacks.
+concurrency:
+  group: efs-shared-deploy
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: eu-west-1
+  PROJECT_NAME: efs-shared
+  BOOTSTRAP_STACK: efs-shared-gitsync
+
+jobs:
+  lint:
+    name: Lint templates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install cfn-lint
+        run: pip install --disable-pip-version-check cfn-lint
+
+      - name: Lint
+        run: cfn-lint templates/*.yaml --region "$AWS_REGION"
+
+  deploy:
+    name: Deploy via Git sync
+    needs: lint
+    runs-on: ubuntu-latest
+    outputs:
+      scope: ${{ steps.rollout.outputs.scope }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assume the deployment role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          role-session-name: gh-actions-efs-shared
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Roll out Git sync in stages
+        id: rollout
+        env:
+          CONNECTION_ARN: ${{ secrets.AWS_CONNECTION_ARN }}
+          SYNC_SCOPE: ${{ github.event.inputs.sync_scope || 'all' }}
+        run: |
+          set -euo pipefail
+          echo "scope=$SYNC_SCOPE" >> "$GITHUB_OUTPUT"
+
+          owner="${GITHUB_REPOSITORY%%/*}"
+          repo="${GITHUB_REPOSITORY##*/}"
+
+          deploy_scope () {
+            echo "::group::bootstrap -> SyncScope=$1"
+            aws cloudformation deploy \
+              --stack-name "$BOOTSTRAP_STACK" \
+              --template-file templates/00-gitsync.yaml \
+              --capabilities CAPABILITY_NAMED_IAM \
+              --no-fail-on-empty-changeset \
+              --parameter-overrides \
+                ConnectionArn="$CONNECTION_ARN" \
+                GitHubOwner="$owner" \
+                RepositoryName="$repo" \
+                BranchName=main \
+                ProjectName="$PROJECT_NAME" \
+                SyncScope="$1"
+            echo "::endgroup::"
+          }
+
+          # A sync configuration builds its stack asynchronously, so wait for the
+          # stack itself rather than for the bootstrap deploy to return.
+          wait_stack () {
+            local name="$1" status
+            echo "waiting for $name"
+            for _ in $(seq 1 90); do
+              status=$(aws cloudformation describe-stacks --stack-name "$name" \
+                        --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo NOT_FOUND)
+              case "$status" in
+                *ROLLBACK*|*FAILED*)
+                  echo "::error::$name reached $status"
+                  aws cloudformation describe-stack-events --stack-name "$name" \
+                    --query 'StackEvents[?ResourceStatus==`CREATE_FAILED`].[LogicalResourceId,ResourceStatusReason]' \
+                    --output text | head -20 || true
+                  exit 1 ;;
+                *_COMPLETE)
+                  echo "$name: $status"
+                  return 0 ;;
+                *)
+                  sleep 20 ;;
+              esac
+            done
+            echo "::error::timed out waiting for $name"
+            exit 1
+          }
+
+          deploy_scope network
+          wait_stack "${PROJECT_NAME}-network"
+
+          if [ "$SYNC_SCOPE" != "network" ]; then
+            deploy_scope network-and-storage
+            wait_stack "${PROJECT_NAME}-storage"
+          fi
+
+          if [ "$SYNC_SCOPE" = "all" ]; then
+            deploy_scope all
+            wait_stack "${PROJECT_NAME}-compute"
+          fi
+
+      - name: Summarise
+        if: always()
+        run: |
+          {
+            echo "## Stacks"
+            echo
+            echo "| Stack | Status |"
+            echo "|---|---|"
+            for s in gitsync network storage compute; do
+              status=$(aws cloudformation describe-stacks --stack-name "${PROJECT_NAME}-${s}" \
+                        --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo "not created")
+              echo "| ${PROJECT_NAME}-${s} | ${status} |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  verify:
+    name: Verify EFS is shared
+    needs: deploy
+    if: needs.deploy.outputs.scope == 'all' && github.event.inputs.run_verification != 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assume the deployment role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          role-session-name: gh-actions-efs-verify
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Wait for instances to register with Systems Manager
+        run: |
+          set -euo pipefail
+          asg="${PROJECT_NAME}-asg"
+          for _ in $(seq 1 30); do
+            ids=$(aws autoscaling describe-auto-scaling-groups \
+                    --auto-scaling-group-names "$asg" \
+                    --query 'AutoScalingGroups[0].Instances[?LifecycleState==`InService`].InstanceId' \
+                    --output text)
+            if [ -n "$ids" ]; then
+              online=$(aws ssm describe-instance-information \
+                        --filters "Key=InstanceIds,Values=$(echo "$ids" | tr '\t' ',')" \
+                        --query 'length(InstanceInformationList[?PingStatus==`Online`])' --output text 2>/dev/null || echo 0)
+              echo "InService: $(echo "$ids" | wc -w), Online in SSM: $online"
+              [ "$online" -ge 2 ] && exit 0
+            fi
+            sleep 20
+          done
+          echo "::error::instances did not register with Systems Manager in time"
+          exit 1
+
+      - name: Run end-to-end verification
+        run: |
+          chmod +x scripts/verify-efs.sh
+          scripts/verify-efs.sh "$PROJECT_NAME" "$AWS_REGION" | tee verification.txt
+
+      - name: Publish verification output
+        if: always()
+        run: |
+          {
+            echo "## EFS verification"
+            echo
+            echo '```'
+            sed 's/\x1b\[[0-9;]*m//g' verification.txt 2>/dev/null || echo "no output captured"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,249 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >-
+  Seed stack - the single manual step in the whole pipeline. Creates the IAM
+  role that GitHub Actions assumes through OIDC federation, so the deployment
+  workflow can provision everything else without any long-lived AWS credentials
+  stored in GitHub.
+
+  Deploy this once from the CloudFormation console, then never touch it again.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Repository that is allowed to assume the role
+        Parameters:
+          - GitHubOwner
+          - RepositoryName
+          - BranchName
+      - Label:
+          default: AWS side
+        Parameters:
+          - ProjectName
+          - ConnectionArn
+          - CreateOidcProvider
+
+Parameters:
+  GitHubOwner:
+    Type: String
+    Default: muhumuza-ivan
+    MinLength: 1
+    Description: GitHub user or organization that owns the repository.
+
+  RepositoryName:
+    Type: String
+    Default: amazon-efs
+    MinLength: 1
+    Description: Repository name, without the owner prefix.
+
+  BranchName:
+    Type: String
+    Default: main
+    MinLength: 1
+    Description: >-
+      Only workflow runs on this branch may assume the role. Pull request runs
+      produce a different subject claim and are therefore refused, which stops a
+      fork's PR from deploying to the account.
+
+  ProjectName:
+    Type: String
+    Default: efs-shared
+    AllowedPattern: "^[a-z][a-z0-9-]{2,30}$"
+    Description: >-
+      Prefix that bounds what this role may touch. It can only manage
+      CloudFormation stacks and IAM roles whose names start with this value.
+
+  ConnectionArn:
+    Type: String
+    AllowedPattern: "^arn:aws[a-zA-Z-]*:codeconnections:[a-z0-9-]+:\\d{12}:connection/[0-9a-fA-F-]+$"
+    Description: >-
+      ARN of the existing CodeConnections connection to GitHub. Used to scope
+      the role's UseConnection permission to that one connection.
+
+  CreateOidcProvider:
+    Type: String
+    Default: "No"
+    AllowedValues:
+      - "Yes"
+      - "No"
+    Description: >-
+      Most accounts already have the GitHub Actions OIDC provider, and creating
+      a second one fails. Leave as No to reuse the existing provider; set to Yes
+      only in an account that has never federated GitHub Actions before.
+
+Conditions:
+  ShouldCreateOidcProvider: !Equals [!Ref CreateOidcProvider, "Yes"]
+
+Resources:
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: ShouldCreateOidcProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+      ThumbprintList:
+        - 6938fd4d98bab03faadb97b34396831e3780aea1
+        - 1c58a3a8518e8759bf075b76b750d4f2df264fcd
+
+  # ---------------------------------------------------------------------------
+  # The role GitHub Actions assumes.
+  #
+  # The sub claim pins assumption to one repository and one branch. Everything
+  # this role can do is bounded by ProjectName, and it deliberately holds no
+  # EC2, EFS or Auto Scaling permissions at all: it only ever deploys the Git
+  # sync bootstrap stack. The infrastructure itself is provisioned by Git sync
+  # assuming the separate, more privileged role that bootstrap stack creates.
+  # ---------------------------------------------------------------------------
+  GitHubActionsDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-github-actions-role"
+      Description: Assumed by GitHub Actions via OIDC to deploy the Git sync bootstrap stack
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: GitHubActionsOidcTrust
+            Effect: Allow
+            Principal:
+              Federated: !If
+                - ShouldCreateOidcProvider
+                - !Ref GitHubOidcProvider
+                - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com"
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub: !Sub "repo:${GitHubOwner}/${RepositoryName}:ref:refs/heads/${BranchName}"
+      Policies:
+        - PolicyName: deploy-gitsync-bootstrap
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ManageProjectStacks
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:UpdateStack
+                  - cloudformation:DeleteStack
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:ListChangeSets
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStackResource
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:GetTemplate
+                  - cloudformation:GetTemplateSummary
+                  - cloudformation:TagResource
+                  - cloudformation:UntagResource
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ProjectName}-*"
+                  - !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ProjectName}-*/*"
+
+              - Sid: TemplateValidation
+                Effect: Allow
+                Action:
+                  - cloudformation:ValidateTemplate
+                  - cloudformation:ListStacks
+                Resource: "*"
+
+              - Sid: ManageGitSyncServiceRole
+                Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:GetRole
+                  - iam:UpdateAssumeRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:GetRolePolicy
+                  - iam:ListRolePolicies
+                  - iam:ListAttachedRolePolicies
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:TagRole
+                  - iam:UntagRole
+                  - iam:PassRole
+                Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${ProjectName}-*"
+
+              - Sid: ManageGitSyncConfiguration
+                Effect: Allow
+                Action:
+                  - codeconnections:CreateRepositoryLink
+                  - codeconnections:DeleteRepositoryLink
+                  - codeconnections:GetRepositoryLink
+                  - codeconnections:UpdateRepositoryLink
+                  - codeconnections:ListRepositoryLinks
+                  - codeconnections:CreateSyncConfiguration
+                  - codeconnections:DeleteSyncConfiguration
+                  - codeconnections:GetSyncConfiguration
+                  - codeconnections:UpdateSyncConfiguration
+                  - codeconnections:ListSyncConfigurations
+                  - codeconnections:GetSyncBlockerSummary
+                  - codeconnections:GetResourceSyncStatus
+                  - codeconnections:ListTagsForResource
+                  - codeconnections:TagResource
+                  - codeconnections:UntagResource
+                Resource: "*"
+
+              - Sid: UseThisConnectionOnly
+                Effect: Allow
+                Action:
+                  - codeconnections:UseConnection
+                  - codeconnections:PassConnection
+                  - codeconnections:GetConnection
+                Resource: !Ref ConnectionArn
+
+        - PolicyName: verify-deployment
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Read-only checks plus SSM command execution, so the workflow can
+              # prove the file system actually mounts and is shared. There is no
+              # SSH path to these instances, so Run Command is the only way in.
+              - Sid: InspectDeployedInfrastructure
+                Effect: Allow
+                Action:
+                  - autoscaling:DescribeAutoScalingGroups
+                  - ec2:DescribeInstances
+                  - ec2:DescribeInternetGateways
+                  - ec2:DescribeNatGateways
+                  - ssm:DescribeInstanceInformation
+                  - ssm:GetCommandInvocation
+                  - ssm:ListCommandInvocations
+                  - ssm:ListCommands
+                Resource: "*"
+
+              - Sid: RunVerificationCommands
+                Effect: Allow
+                Action: ssm:SendCommand
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+                  - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}::document/AWS-RunShellScript"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-github-actions-role"
+        - Key: Project
+          Value: efs-shared-storage
+        - Key: ManagedBy
+          Value: cloudformation
+
+Outputs:
+  DeployRoleArn:
+    Description: >-
+      Add this to the GitHub repository as the AWS_DEPLOY_ROLE_ARN secret.
+    Value: !GetAtt GitHubActionsDeployRole.Arn
+
+  ConnectionArnForSecret:
+    Description: >-
+      Add this to the GitHub repository as the AWS_CONNECTION_ARN secret.
+    Value: !Ref ConnectionArn
+
+  TrustedSubject:
+    Description: The only OIDC subject claim permitted to assume the role
+    Value: !Sub "repo:${GitHubOwner}/${RepositoryName}:ref:refs/heads/${BranchName}"
