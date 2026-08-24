@@ -60,10 +60,16 @@ replaces CloudFormation's default allow-all egress rule rather than inheriting i
 
 These are the non-obvious choices, and each one is load-bearing:
 
-- **User data installs nothing.** `amazon-efs-utils` ships with the Amazon Linux 2023 AMI.
-  That matters because AL2023's `dnf` mirrorlist points at `cdn.amazonlinux.com`, which is
-  unreachable from a VPC with no NAT and no internet gateway. Any bootstrap that tried to
-  install a package here would hang.
+- **`amazon-efs-utils` is installed at boot, over the S3 gateway endpoint.** It is *not*
+  on the AL2023 AMI, contrary to what much of the documentation implies; without it the
+  mount fails with `unknown filesystem type 'efs'`. AL2023's `dnf` mirrorlist points at a
+  regional S3 bucket rather than `cdn.amazonlinux.com`, so the free gateway endpoint is
+  enough and no NAT gateway is needed.
+- **Instance egress must include the S3 prefix list.** Traffic to a gateway endpoint
+  leaves the instance addressed to S3's public ranges, so security group rules apply to it
+  like any other egress. With the route present but the rule missing, packets are dropped
+  by the security group before they reach the endpoint — which presents as a broken
+  endpoint rather than as a permissions problem.
 - **The share is mounted by file system *id*, not DNS name.** The mount helper resolves an
   id straight to the mount target's ENI address without calling an AWS API, so no EFS
   interface endpoint is needed.
@@ -155,19 +161,26 @@ settle before continuing.
 | `StorageSync` | `deployments/storage.yaml` | `efs-shared-storage` |
 | `ComputeSync` | `deployments/compute.yaml` | `efs-shared-compute` |
 
-Once a stack is synced, editing its template or deployment file and committing to `main`
-updates it directly through Git sync. `TriggerResourceUpdateOn: FILE_CHANGE` means only
-the stack whose files changed is updated, so a compute change does not churn the network
-stack.
+**Editing a template and pushing to `main` is the whole workflow.** Git sync detects the
+commit and updates the affected stack; the pipeline waits for that sync to reach the
+commit's SHA and then re-runs the verification. `TriggerResourceUpdateOn: ANY_CHANGE`
+keeps every stack's sync status tied to the latest commit, so the pipeline can always tell
+"synced for this commit" from "never synced".
+
+The pipeline creates a stack only when it does not exist yet. After that it stands back
+and lets Git sync own updates, so the two never race each other on the same stack.
 
 **Two roles, deliberately unequal.** The role GitHub Actions assumes can do very little:
 it may manage `efs-shared-*` CloudFormation stacks and IAM roles, use one named
 connection, and run verification commands — it holds no EC2, EFS or Auto Scaling
-permissions at all. The privileged role belongs to Git sync, is created by the bootstrap
-stack, and is the one that actually provisions infrastructure. Its trust policy carries
-`aws:SourceAccount` and `aws:SourceArn` conditions so no other account's connection can
-assume it, and the GitHub role's trust is pinned to one repository and one branch, so a
-fork's pull request cannot deploy into the account.
+permissions at all. It provisions infrastructure by *passing* the privileged role rather
+than wielding one: `aws cloudformation deploy --role-arn` makes CloudFormation assume the
+provisioning role to do the work. That same role is what Git sync assumes, so the
+permissions are identical whether a change arrives through the pipeline or through a sync.
+
+Its trust policy carries `aws:SourceAccount` and `aws:SourceArn` conditions so no other
+account's connection can assume it, and the GitHub role's trust is pinned to one
+repository and one branch, so a fork's pull request cannot deploy into the account.
 
 ### Option B — direct deploy (useful as a first smoke test)
 

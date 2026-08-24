@@ -52,6 +52,17 @@ Parameters:
     AllowedPattern: "^(\\d{1,3}\\.){3}\\d{1,3}/\\d{1,2}$"
     Description: CIDR block for the private subnet in the second Availability Zone.
 
+  S3PrefixListId:
+    Type: String
+    Default: pl-6da54004
+    AllowedPattern: "^pl-[0-9a-f]+$"
+    Description: >-
+      Managed prefix list for S3 in this Region, used to allow instance egress
+      to the S3 gateway endpoint. The id differs per Region; find yours with
+      "aws ec2 describe-prefix-lists --filters
+      Name=prefix-list-name,Values=com.amazonaws.<region>.s3".
+      The default is the eu-west-1 value.
+
 Resources:
   # ---------------------------------------------------------------------------
   # VPC
@@ -202,6 +213,17 @@ Resources:
           FromPort: 2049
           ToPort: 2049
           DestinationSecurityGroupId: !Ref EfsSecurityGroup
+        # Traffic to a gateway endpoint leaves the instance addressed to S3's
+        # public ranges, so it is matched by security group rules like any other
+        # egress. Without this rule the route table sends packets to the endpoint
+        # and the security group drops them first, which looks exactly like a
+        # broken endpoint. The instances need it to install amazon-efs-utils
+        # from the regional Amazon Linux repository, which is hosted on S3.
+        - Description: HTTPS to S3 via the gateway endpoint (Amazon Linux repositories)
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          DestinationPrefixListId: !Ref S3PrefixListId
       Tags:
         - Key: Name
           Value: !Sub "${ProjectName}-instance-sg"

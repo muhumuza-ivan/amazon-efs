@@ -197,12 +197,26 @@ Resources:
                 FS="${FileSystemIdValue}"
                 AP="${AccessPointIdValue}"
 
-                # Nothing is installed here, on purpose. amazon-efs-utils ships
-                # with the Amazon Linux 2023 AMI, and the mount helper resolves a
-                # file system id straight to the mount target's ENI address
-                # without calling any AWS API. That is what lets this instance
-                # mount the share with no NAT gateway and no internet gateway.
                 mkdir -p "$MP"
+
+                # amazon-efs-utils is NOT on the AL2023 AMI, despite what a lot
+                # of documentation implies - without it the mount fails with
+                # "unknown filesystem type 'efs'". It is installed from the
+                # regional Amazon Linux repository, which is hosted on S3 and
+                # reached through the gateway endpoint, so this still needs no
+                # NAT gateway and no internet gateway.
+                if ! command -v mount.efs >/dev/null 2>&1; then
+                  for attempt in $(seq 1 5); do
+                    dnf -y install amazon-efs-utils && break
+                    echo "amazon-efs-utils install attempt $attempt failed, retrying"
+                    sleep 20
+                  done
+                fi
+
+                if ! command -v mount.efs >/dev/null 2>&1; then
+                  echo "FATAL: amazon-efs-utils could not be installed" >&2
+                  exit 1
+                fi
 
                 if ! grep -q " $MP " /etc/fstab; then
                   echo "$FS $MP efs _netdev,tls,iam,accesspoint=$AP 0 0" >> /etc/fstab

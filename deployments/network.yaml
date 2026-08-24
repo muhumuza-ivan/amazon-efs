@@ -10,6 +10,8 @@ parameters:
   VpcCidr: 10.0.0.0/16
   PrivateSubnet1Cidr: 10.0.1.0/24
   PrivateSubnet2Cidr: 10.0.2.0/24
+  # S3 managed prefix list for eu-west-1; differs per Region.
+  S3PrefixListId: pl-6da54004
 
 tags:
   Project: efs-shared-storage

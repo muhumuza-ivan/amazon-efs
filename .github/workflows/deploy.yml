@@ -112,6 +112,57 @@ jobs:
           owner="${GITHUB_REPOSITORY%%/*}"
           repo="${GITHUB_REPOSITORY##*/}"
 
+          stack_status () {
+            aws cloudformation describe-stacks --stack-name "$1" \
+              --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo NOT_FOUND
+          }
+
+          # The deployment file is the single source of truth for what a stack is
+          # made of, so read the template path, parameters and tags straight out
+          # of the same file Git sync reads. Parsed with awk rather than a YAML
+          # library so the job needs no Python packages installed.
+          dep_template () { awk '/^template-file-path:/ {print $2; exit}' "$1"; }
+          dep_section () {
+            awk -v sect="$2" '
+              /^[a-z][a-z-]*:/ { inside = ($0 ~ "^" sect ":"); next }
+              inside && /^  [A-Za-z]/ { sub(/^  /, ""); sub(/: */, "="); print }
+            ' "$1" | tr "\n" " "
+          }
+
+          # Git sync only ever creates a change set against an existing stack, so
+          # a stack must exist before a sync configuration can manage it.
+          #
+          # The stack is created with --role-arn, which makes CloudFormation
+          # assume the provisioning role to do the work. That is why this
+          # workflow's own role holds no EC2, EFS or Auto Scaling permissions and
+          # still deploys the infrastructure: it passes a role rather than
+          # wielding one. The same role provisions whether the trigger is this
+          # pipeline or a Git sync.
+          #
+          # Once the stack exists this is a no-op and Git sync owns every update,
+          # which keeps the two from racing each other on the same stack.
+          ensure_stack () {
+            local name="$1" depfile="$2" caps="${3:-}" status tmpl params tags
+            status=$(stack_status "$name")
+            if [ "$status" != "NOT_FOUND" ]; then
+              echo "$name exists ($status) - Git sync owns updates"
+              return 0
+            fi
+            tmpl=$(dep_template "$depfile")
+            params=$(dep_section "$depfile" parameters)
+            tags=$(dep_section "$depfile" tags)
+            echo "creating $name from $tmpl via $PROVISION_ROLE_ARN"
+            # shellcheck disable=SC2086
+            aws cloudformation deploy \
+              --stack-name "$name" \
+              --template-file "$tmpl" \
+              --role-arn "$PROVISION_ROLE_ARN" \
+              --no-fail-on-empty-changeset \
+              ${caps:+--capabilities $caps} \
+              ${params:+--parameter-overrides $params} \
+              ${tags:+--tags $tags}
+          }
+
           deploy_scope () {
             echo "::group::bootstrap -> SyncScope=$1"
             aws cloudformation deploy \
@@ -129,19 +180,43 @@ jobs:
             echo "::endgroup::"
           }
 
-          # A sync configuration builds its stack asynchronously, so wait for the
-          # stack itself rather than for the bootstrap deploy to return.
-          wait_stack () {
-            local name="$1" status
-            echo "waiting for $name"
+          # Creating a sync configuration triggers a sync immediately, so wait on
+          # the sync's own status rather than guessing from the stack. Requiring
+          # the synced SHA to match this commit stops a stale SUCCEEDED from a
+          # previous run being mistaken for this one.
+          wait_sync () {
+            local name="$1" status sha synced=""
+            echo "waiting for Git sync to apply $name"
+            for _ in $(seq 1 60); do
+              status=$(aws codeconnections get-resource-sync-status --sync-type CFN_STACK_SYNC \
+                        --resource-name "$name" --query 'LatestSync.Status' --output text 2>/dev/null || echo NONE)
+              sha=$(aws codeconnections get-resource-sync-status --sync-type CFN_STACK_SYNC \
+                        --resource-name "$name" --query 'LatestSync.TargetRevision.Sha' --output text 2>/dev/null || echo "")
+              if [ "$status" = "SUCCEEDED" ] && [ "$sha" = "$GITHUB_SHA" ]; then
+                synced=yes
+                break
+              fi
+              if [ "$status" = "FAILED" ]; then
+                echo "::error::Git sync failed for $name"
+                aws codeconnections get-resource-sync-status --sync-type CFN_STACK_SYNC \
+                  --resource-name "$name" --query 'LatestSync.Events[].Event' --output text || true
+                exit 1
+              fi
+              sleep 20
+            done
+            if [ -z "$synced" ]; then
+              echo "::error::timed out waiting for Git sync on $name (last status: $status)"
+              exit 1
+            fi
+
+            # The change set keeps executing after the sync reports success.
             for _ in $(seq 1 90); do
-              status=$(aws cloudformation describe-stacks --stack-name "$name" \
-                        --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo NOT_FOUND)
+              status=$(stack_status "$name")
               case "$status" in
                 *ROLLBACK*|*FAILED*)
                   echo "::error::$name reached $status"
                   aws cloudformation describe-stack-events --stack-name "$name" \
-                    --query 'StackEvents[?ResourceStatus==`CREATE_FAILED`].[LogicalResourceId,ResourceStatusReason]' \
+                    --query 'StackEvents[?contains(ResourceStatus,`FAILED`)].[LogicalResourceId,ResourceStatusReason]' \
                     --output text | head -20 || true
                   exit 1 ;;
                 *_COMPLETE)
@@ -151,21 +226,37 @@ jobs:
                   sleep 20 ;;
               esac
             done
-            echo "::error::timed out waiting for $name"
+            echo "::error::timed out waiting for $name to finish updating"
             exit 1
           }
 
+          # Scope "none" creates only the repository link and the provisioning
+          # role. That role has to exist before any stack can be deployed with
+          # --role-arn, and its sync configurations cannot be created until their
+          # target stacks exist - hence the ordering below.
+          if [ "$(stack_status "$BOOTSTRAP_STACK")" = "NOT_FOUND" ]; then
+            deploy_scope none
+          fi
+          PROVISION_ROLE_ARN=$(aws cloudformation describe-stacks \
+            --stack-name "$BOOTSTRAP_STACK" \
+            --query 'Stacks[0].Outputs[?OutputKey==`GitSyncRoleArn`].OutputValue' \
+            --output text)
+          echo "provisioning role: $PROVISION_ROLE_ARN"
+
+          ensure_stack "${PROJECT_NAME}-network" deployments/network.yaml
           deploy_scope network
-          wait_stack "${PROJECT_NAME}-network"
+          wait_sync "${PROJECT_NAME}-network"
 
           if [ "$SYNC_SCOPE" != "network" ]; then
+            ensure_stack "${PROJECT_NAME}-storage" deployments/storage.yaml
             deploy_scope network-and-storage
-            wait_stack "${PROJECT_NAME}-storage"
+            wait_sync "${PROJECT_NAME}-storage"
           fi
 
           if [ "$SYNC_SCOPE" = "all" ]; then
+            ensure_stack "${PROJECT_NAME}-compute" deployments/compute.yaml CAPABILITY_NAMED_IAM
             deploy_scope all
-            wait_stack "${PROJECT_NAME}-compute"
+            wait_sync "${PROJECT_NAME}-compute"
           fi
 
       - name: Summarise

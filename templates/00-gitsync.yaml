@@ -66,21 +66,25 @@ Parameters:
 
   SyncScope:
     Type: String
-    Default: network
+    Default: none
     AllowedValues:
+      - none
       - network
       - network-and-storage
       - all
     Description: >-
-      Which sync configurations to create. Creating a sync configuration for a
-      stack that does not exist yet causes CloudFormation to create that stack
-      immediately, so all three at once would race: storage and compute would
-      fail on exports the network stack has not published yet. Deploy this stack
-      three times - network, then network-and-storage, then all - waiting for
-      each synced stack to reach CREATE_COMPLETE in between.
+      Which sync configurations to create. A sync configuration can only update
+      a stack that already exists - pointed at a missing stack it fails with
+      "Stack does not exist" and does not recover - so each one is added only
+      once its target stack is in place. "none" creates just the repository link
+      and the provisioning role, which is what the pipeline needs before it can
+      deploy anything.
 
 Conditions:
-  SyncStorage: !Not [!Equals [!Ref SyncScope, network]]
+  SyncNetwork: !Not [!Equals [!Ref SyncScope, none]]
+  SyncStorage: !Or
+    - !Equals [!Ref SyncScope, network-and-storage]
+    - !Equals [!Ref SyncScope, all]
   SyncCompute: !Equals [!Ref SyncScope, all]
 
 Resources:
@@ -128,6 +132,19 @@ Resources:
                 aws:SourceAccount: !Ref AWS::AccountId
               ArnLike:
                 aws:SourceArn: !Ref ConnectionArn
+          # CloudFormation assumes this same role when a stack is deployed with
+          # --role-arn. That lets the pipeline create the stacks without holding
+          # any EC2, EFS or Auto Scaling permissions itself: it passes this role
+          # and CloudFormation does the provisioning. One role provisions the
+          # infrastructure whether the trigger is a pipeline run or a Git sync.
+          - Sid: CfnServiceRoleTrustPolicy
+            Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
       Policies:
         - PolicyName: gitsync-cloudformation
           PolicyDocument:
@@ -320,12 +337,13 @@ Resources:
   #
   # ResourceName is the name of the stack this configuration manages. If that
   # stack does not exist, CloudFormation creates it; if it does, Git sync adopts
-  # it. TriggerResourceUpdateOn: FILE_CHANGE limits updates to commits that
+  # it. TriggerResourceUpdateOn: ANY_CHANGE limits updates to commits that
   # actually touch this stack's deployment file or template, so a change to the
   # compute stack does not churn the network stack.
   # ---------------------------------------------------------------------------
   NetworkSync:
     Type: AWS::CodeStarConnections::SyncConfiguration
+    Condition: SyncNetwork
     Properties:
       Branch: !Ref BranchName
       ConfigFile: deployments/network.yaml
@@ -334,7 +352,7 @@ Resources:
       RoleArn: !GetAtt GitSyncRole.Arn
       SyncType: CFN_STACK_SYNC
       PublishDeploymentStatus: ENABLED
-      TriggerResourceUpdateOn: FILE_CHANGE
+      TriggerResourceUpdateOn: ANY_CHANGE
 
   StorageSync:
     Type: AWS::CodeStarConnections::SyncConfiguration
@@ -348,7 +366,7 @@ Resources:
       RoleArn: !GetAtt GitSyncRole.Arn
       SyncType: CFN_STACK_SYNC
       PublishDeploymentStatus: ENABLED
-      TriggerResourceUpdateOn: FILE_CHANGE
+      TriggerResourceUpdateOn: ANY_CHANGE
 
   ComputeSync:
     Type: AWS::CodeStarConnections::SyncConfiguration
@@ -362,7 +380,7 @@ Resources:
       RoleArn: !GetAtt GitSyncRole.Arn
       SyncType: CFN_STACK_SYNC
       PublishDeploymentStatus: ENABLED
-      TriggerResourceUpdateOn: FILE_CHANGE
+      TriggerResourceUpdateOn: ANY_CHANGE
 
 Outputs:
   RepositoryLinkId:
