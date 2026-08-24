@@ -149,15 +149,31 @@ for instance in "${INSTANCES[@]}"; do
   fi
 done
 
-# Each instance drops a marker at boot; every instance should see all of them.
+# Each instance writes a marker at boot, and every instance should be able to
+# see every other instance's marker.
+#
+# The check is presence, not count. A marker outlives the instance that wrote
+# it, so after any scale-in the share holds more markers than there are running
+# instances - comparing counts would report a false failure for what is really
+# just history on the file system.
 EXPECTED="${#INSTANCES[@]}"
 for instance in "${INSTANCES[@]}"; do
-  count=$(run_on "$instance" "ls -1 $MOUNT_POINT/hosts | wc -l")
-  count=$(echo "$count" | tr -d '[:space:]')
-  if [[ "$count" == "$EXPECTED" ]]; then
-    pass "$instance sees all $EXPECTED boot markers in $MOUNT_POINT/hosts"
+  listing=$(run_on "$instance" "ls -1 $MOUNT_POINT/hosts 2>/dev/null || true")
+  missing=""
+  for peer in "${INSTANCES[@]}"; do
+    grep -Fxq "${peer}.txt" <<<"$listing" || missing="$missing $peer"
+  done
+
+  if [[ -n "$missing" ]]; then
+    fail "$instance cannot see boot markers for:$missing"
   else
-    fail "$instance sees $count boot markers, expected $EXPECTED"
+    total=$(grep -c . <<<"$listing" || true)
+    stale=$(( total - EXPECTED ))
+    if (( stale > 0 )); then
+      pass "$instance sees a marker for all $EXPECTED in-service instances ($stale from terminated instances)"
+    else
+      pass "$instance sees a marker for all $EXPECTED in-service instances"
+    fi
   fi
 done
 
