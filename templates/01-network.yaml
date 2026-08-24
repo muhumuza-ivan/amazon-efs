@@ -347,3 +347,10 @@ Outputs:
       - ","
       - - !GetAtt PrivateSubnet1.AvailabilityZone
         - !GetAtt PrivateSubnet2.AvailabilityZone
+
+  S3GatewayEndpointId:
+    Description: >-
+      S3 gateway endpoint. Worth surfacing because instance access to the Amazon
+      Linux repositories depends on it, and a failure there looks like a broken
+      package mirror rather than a networking problem.
+    Value: !Ref S3GatewayEndpoint
