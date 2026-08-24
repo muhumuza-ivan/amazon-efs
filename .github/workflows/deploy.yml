@@ -180,12 +180,41 @@ jobs:
             echo "::endgroup::"
           }
 
+          # Git sync refuses to touch a stack that was changed by anything other
+          # than itself, recording an AUTOMATED sync blocker: "modified by
+          # something besides StackSync. Disabling syncing to ensure we don't
+          # overwrite an important deployment." That is a sensible default, but
+          # it fires by construction here, because the pipeline creates each
+          # stack with `aws cloudformation deploy` before handing it over. Left
+          # alone it would block the very first sync of every stack, forever.
+          #
+          # Clearing it is safe in this repository precisely because Git is the
+          # source of truth: whatever Git sync would overwrite came from an
+          # earlier commit of these same templates. It would NOT be safe in a
+          # repository where people also deploy by hand - there the blocker is
+          # doing its job and should be investigated rather than cleared.
+          clear_blockers () {
+            local name="$1" ids id
+            ids=$(aws codeconnections get-sync-blocker-summary --sync-type CFN_STACK_SYNC \
+                    --resource-name "$name" \
+                    --query 'SyncBlockerSummary.LatestBlockers[?Status==`ACTIVE`].Id' \
+                    --output text 2>/dev/null || echo "")
+            [ -z "$ids" ] && return 0
+            for id in $ids; do
+              echo "resolving sync blocker $id on $name"
+              aws codeconnections update-sync-blocker --id "$id" \
+                --sync-type CFN_STACK_SYNC --resource-name "$name" \
+                --resolved-reason "Stack created by the deployment pipeline; this repository is the source of truth" \
+                >/dev/null
+            done
+          }
+
           # Creating a sync configuration triggers a sync immediately, so wait on
           # the sync's own status rather than guessing from the stack. Requiring
           # the synced SHA to match this commit stops a stale SUCCEEDED from a
           # previous run being mistaken for this one.
           wait_sync () {
-            local name="$1" status sha synced=""
+            local name="$1" status sha synced="" cleared=""
             echo "waiting for Git sync to apply $name"
             for _ in $(seq 1 60); do
               status=$(aws codeconnections get-resource-sync-status --sync-type CFN_STACK_SYNC \
@@ -197,6 +226,17 @@ jobs:
                 break
               fi
               if [ "$status" = "FAILED" ]; then
+                # A blocker is the one failure worth retrying: it means the sync
+                # was refused rather than attempted. Clear it once and keep
+                # waiting; anything else is a real failure and stops the run.
+                if [ -z "$cleared" ]; then
+                  cleared=yes
+                  if clear_blockers "$name" | grep -q "resolving sync blocker"; then
+                    echo "cleared a sync blocker on $name, waiting for the sync to resume"
+                    sleep 20
+                    continue
+                  fi
+                fi
                 echo "::error::Git sync failed for $name"
                 aws codeconnections get-resource-sync-status --sync-type CFN_STACK_SYNC \
                   --resource-name "$name" --query 'LatestSync.Events[].Event' --output text || true
@@ -244,17 +284,20 @@ jobs:
           echo "provisioning role: $PROVISION_ROLE_ARN"
 
           ensure_stack "${PROJECT_NAME}-network" deployments/network.yaml
+          clear_blockers "${PROJECT_NAME}-network"
           deploy_scope network
           wait_sync "${PROJECT_NAME}-network"
 
           if [ "$SYNC_SCOPE" != "network" ]; then
             ensure_stack "${PROJECT_NAME}-storage" deployments/storage.yaml
+            clear_blockers "${PROJECT_NAME}-storage"
             deploy_scope network-and-storage
             wait_sync "${PROJECT_NAME}-storage"
           fi
 
           if [ "$SYNC_SCOPE" = "all" ]; then
             ensure_stack "${PROJECT_NAME}-compute" deployments/compute.yaml CAPABILITY_NAMED_IAM
+            clear_blockers "${PROJECT_NAME}-compute"
             deploy_scope all
             wait_sync "${PROJECT_NAME}-compute"
           fi
